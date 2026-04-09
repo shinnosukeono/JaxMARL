@@ -511,7 +511,7 @@ class OvercookedV2(MultiAgentEnv):
                 case ObservationType.DEFAULT:
                     num_ingredients = self.layout.num_ingredients
                     #17(Invariable objects[5 position and directions for each agents, wall, goal, pot, plate pile, recipe indicator, button, pot timer] + 4*(num_ingredients+2) objects[Inventory for each agents, recipe, grid] + N(ingredient pile))
-                    num_layers = 17 + N + 4 * (num_ingredients + 2)
+                    num_layers = 17 + num_ingredients + 4 * (num_ingredients + 2)
 
                     if self.indicate_successful_delivery:
                         num_layers += 1
