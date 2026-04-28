@@ -1,0 +1,20 @@
+# Belief-model training (OBL stage 1).
+# Mirrors pyhanabi/configs (no dedicated yaml upstream — replicates train_belief.py).
+
+"TOTAL_TIMESTEPS": 1e8
+"NUM_ENVS": 256
+"NUM_STEPS": 80
+"BUFFER_SIZE": 50000
+"BUFFER_BATCH_SIZE": 64
+
+"HIDDEN_SIZE": 512
+"LR": 6.25e-5
+"NUM_EPOCHS": 1
+"MAX_GRAD_NORM": 5.0
+
+"ENV_NAME": "hanabi"
+"ENV_KWARGS": {
+  "num_agents": 2,
+}
+
+"ALG_NAME": "obl_belief_hanabi"

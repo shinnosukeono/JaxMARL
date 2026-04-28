@@ -1,0 +1,33 @@
+# OBL on Hanabi (single-step OBL approximation; see obl_rnn_hanabi.py
+# docstring for what's wired and what's TODO).
+
+"TOTAL_TIMESTEPS": 5e8
+"NUM_ENVS": 256
+"NUM_STEPS": 80
+"BUFFER_SIZE": 50000
+"BUFFER_BATCH_SIZE": 64
+
+"HIDDEN_SIZE": 512
+"LR": 6.25e-5
+"ADAM_EPS": 1.5e-5
+"GAMMA": 0.999
+"EPS_START": 0.1
+"EPS_FINISH": 0.001
+"EPS_DECAY": 0.1
+"MAX_GRAD_NORM": 5.0
+"TARGET_UPDATE_INTERVAL": 2500
+"TAU": 1.0
+"LEARNING_STARTS": 10000
+"REW_SCALE": 1.0
+"NUM_BELIEF_SAMPLES": 1   # # of fictitious own-hands to average per target
+
+# Provide BP and belief checkpoints (safetensors paths).
+"BP_CHECKPOINT": "models/hanabi_2p/r2d2_publ_rnn_hanabi_hanabi_2p_seed0_vmap0.safetensors"
+"BELIEF_CHECKPOINT": "models/hanabi_2p/belief_seed0.safetensors"
+
+"ENV_NAME": "hanabi"
+"ENV_KWARGS": {
+  "num_agents": 2,
+}
+
+"ALG_NAME": "obl_rnn_hanabi"

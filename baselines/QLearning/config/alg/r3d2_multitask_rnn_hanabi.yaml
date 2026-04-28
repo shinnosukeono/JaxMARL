@@ -1,0 +1,35 @@
+# Multi-task R3D2: train one network across 2,3,4,5-player Hanabi.
+# Mirrors r3d2-multitask.yaml + r3d2_main.py(--num_player 6) from the upstream repo.
+
+"PLAYER_COUNTS": [2, 3, 4, 5]
+"NUM_ENVS_PER_SETTING": 64
+"NUM_STEPS": 80
+"BUFFER_SIZE": 50000
+"BUFFER_BATCH_SIZE": 64
+"TOTAL_TIMESTEPS": 5e8
+
+"HIDDEN_SIZE": 128
+"EPS_START": 0.1
+"EPS_FINISH": 0.001
+"EPS_DECAY": 0.1
+"MAX_GRAD_NORM": 5.0
+"TARGET_UPDATE_INTERVAL": 2500
+"TAU": 1.0
+"NUM_EPOCHS": 1
+"LR": 6.25e-5
+"ADAM_EPS": 1.5e-5
+"LEARNING_STARTS": 10000
+"GAMMA": 0.999
+"MULTI_STEP": 1
+"REW_SCALE": 1.0
+
+# text encoders (shared across player counts, frozen)
+"BERT_MODEL_DIR": "baselines/QLearning/pretrained_text/tinybert_l2_flax"
+"MAX_OBS_TOKENS": 256
+"MAX_ACTION_TOKENS": 12
+"INCLUDE_BELIEF": False
+
+"ENV_NAME": "hanabi"
+
+"LOG_EVERY": 50
+"ALG_NAME": "r3d2_multitask_rnn_hanabi"

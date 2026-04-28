@@ -1,0 +1,39 @@
+# R2D2 (public/private LSTM) on Hanabi.
+# Mirrors the iql.yaml hyperparameters from R3D2-A-Generalist-Hanabi-Agent
+# (vdn=0, net=publ-lstm) but reframed for jaxmarl's vectorised loop.
+
+"TOTAL_TIMESTEPS": 5e8         # ~ 1000 epoch * 500 batchsize 64 * NUM_ENVS rollouts
+"NUM_ENVS": 1024
+"NUM_STEPS": 80                # max episode length (max_len: 80 in original yaml)
+"BUFFER_SIZE": 50000
+"BUFFER_BATCH_SIZE": 64
+
+"HIDDEN_SIZE": 512
+"EPS_START": 0.1               # act_base_eps
+"EPS_FINISH": 0.001
+"EPS_DECAY": 0.1
+"MAX_GRAD_NORM": 5.0
+"TARGET_UPDATE_INTERVAL": 2500 # num_update_between_sync
+"TAU": 1.0                     # hard target update
+"NUM_EPOCHS": 1
+"LR": 6.25e-5
+"ADAM_EPS": 1.5e-5
+"LR_LINEAR_DECAY": False
+"LEARNING_STARTS": 10000       # burn_in_frames
+"GAMMA": 0.999
+"MULTI_STEP": 1                # set >1 for n-step targets
+"REW_SCALE": 1.0
+
+# ENV
+"ENV_NAME": "hanabi"
+"ENV_KWARGS": {
+  "num_agents": 2,
+}
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.01
+"TEST_NUM_STEPS": 80
+"TEST_NUM_ENVS": 256
+
+"ALG_NAME": "r2d2_publ_rnn_hanabi"
