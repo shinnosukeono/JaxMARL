@@ -66,14 +66,17 @@ def _make_update_step(
     config,
     env,
     bert_module,
-    bert_params,
     tokenize_fn,
     bert_hidden: int,
     action_emb,
     network: R3D2Net,
     buffer,
 ):
-    """Build the (rollout + learn + target-update) function for one env."""
+    """Build the (rollout + learn + target-update) function for one env.
+
+    Returns `update_step(train_state, buffer_state, bert_params, rng)` —
+    `bert_params` is a runtime arg so XLA does not constant-fold BERT.
+    """
 
     eps_scheduler = optax.linear_schedule(
         init_value=config["EPS_START"],
@@ -87,7 +90,7 @@ def _make_update_step(
     NUM_ENVS = config["NUM_ENVS_PER_SETTING"]
     NUM_STEPS = config["NUM_STEPS"]
 
-    def encode_text(input_ids, attention_mask):
+    def encode_text(bert_params, input_ids, attention_mask):
         leading = input_ids.shape[:-1]
         flat_ids = input_ids.reshape(-1, input_ids.shape[-1])
         flat_mask = attention_mask.reshape(-1, attention_mask.shape[-1])
@@ -101,11 +104,11 @@ def _make_update_step(
         h = (h * m).sum(axis=1) / jnp.clip(m.sum(axis=1), a_min=1.0)
         return h.reshape(*leading, bert_hidden)
 
-    def encode_state_dict(env_state, prev_env_state, last_actions):
+    def encode_state_dict(bert_params, env_state, prev_env_state, last_actions):
         new_inner = env_state.env_state
         old_inner = prev_env_state.env_state
         ids, mask = tokenize_fn(new_inner, old_inner, last_actions)
-        emb = encode_text(ids, mask)
+        emb = encode_text(bert_params, ids, mask)
         return {a: emb[i] for i, a in enumerate(env.agents)}
 
     def get_greedy_actions(q_vals, valid_actions):
@@ -137,7 +140,7 @@ def _make_update_step(
 
     wrapped_env = CTRolloutManager(env, batch_size=NUM_ENVS)
 
-    def update_step(train_state, buffer_state, rng):
+    def update_step(train_state, buffer_state, bert_params, rng):
         # ---- rollout ----
         def _step_env(carry, _):
             hs, last_state_emb, last_dones, env_state, prev_state, last_actions, rng = carry
@@ -162,7 +165,7 @@ def _make_update_step(
             obs, new_env_state, rewards, dones, infos = wrapped_env.batch_step(
                 rng_s, env_state, actions
             )
-            new_state_emb = encode_state_dict(new_env_state, env_state, cur_player_action)
+            new_state_emb = encode_state_dict(bert_params, new_env_state, env_state, cur_player_action)
             ts = Timestep(
                 state_emb=last_state_emb,
                 actions=actions,
@@ -178,7 +181,7 @@ def _make_update_step(
         rng, _rng = jax.random.split(rng)
         init_obs, env_state = wrapped_env.batch_reset(_rng)
         init_actions = jnp.full((NUM_ENVS,), env.num_moves - 1, dtype=jnp.int32)
-        init_state_emb = encode_state_dict(env_state, env_state, init_actions)
+        init_state_emb = encode_state_dict(bert_params, env_state, env_state, init_actions)
         init_dones = {
             a: jnp.zeros((NUM_ENVS,), dtype=bool) for a in env.agents + ["__all__"]
         }
@@ -355,7 +358,7 @@ def make_train_multitask(config, envs, bert_module, bert_params, tokenize_fns,
                 period=1,
             )
             update_fn_i, wrapped_i = _make_update_step(
-                config, env_i, bert_module, bert_params, tokfn_i, bert_hidden,
+                config, env_i, bert_module, tokfn_i, bert_hidden,
                 action_emb_i, network, buffer_i,
             )
             update_fns.append(update_fn_i)
@@ -377,7 +380,7 @@ def make_train_multitask(config, envs, bert_module, bert_params, tokenize_fns,
             env_idx = u % n_envs
             rng, _rng = jax.random.split(rng)
             train_state, buffer_states[env_idx], metrics = update_fns[env_idx](
-                train_state, buffer_states[env_idx], _rng
+                train_state, buffer_states[env_idx], bert_params, _rng
             )
             if wandb_enabled and u % max(1, int(config.get("LOG_EVERY", 50))) == 0:
                 wandb.log(

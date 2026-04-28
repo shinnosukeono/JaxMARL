@@ -143,11 +143,16 @@ def make_train(
     config,
     env,
     bert_module,
-    bert_params,
     tokenize_fn,
     bert_hidden: int,
     action_emb,
 ):
+    """Returns `train(rng, bert_params)`.
+
+    `bert_params` is threaded as a runtime arg (not closed over) so XLA does
+    not constant-fold BERT's embedding gathers. Broadcast across seeds via
+    `jax.vmap(train, in_axes=(0, None))`.
+    """
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -159,7 +164,7 @@ def make_train(
     multi_step = int(config.get("MULTI_STEP", 1))
     gamma = float(config["GAMMA"])
 
-    def encode_text(input_ids, attention_mask):
+    def encode_text(bert_params, input_ids, attention_mask):
         leading = input_ids.shape[:-1]
         flat_ids = input_ids.reshape(-1, input_ids.shape[-1])
         flat_mask = attention_mask.reshape(-1, attention_mask.shape[-1])
@@ -200,14 +205,14 @@ def make_train(
     def unbatchify(x):
         return {a: x[i] for i, a in enumerate(env.agents)}
 
-    def encode_state_dict(env_state, prev_env_state, last_actions):
+    def encode_state_dict(bert_params, env_state, prev_env_state, last_actions):
         new_inner = env_state.env_state
         old_inner = prev_env_state.env_state
         ids, mask = tokenize_fn(new_inner, old_inner, last_actions)
-        emb = encode_text(ids, mask)
+        emb = encode_text(bert_params, ids, mask)
         return {a: emb[i] for i, a in enumerate(env.agents)}
 
-    def train(rng):
+    def train(rng, bert_params):
         original_seed = rng[0]
         rng, _rng = jax.random.split(rng)
         wrapped_env = CTRolloutManager(env, batch_size=config["NUM_ENVS"])
@@ -261,7 +266,7 @@ def make_train(
                 actions[a] * env_state.env_state.cur_player_idx[..., i].astype(jnp.int32)
                 for i, a in enumerate(env.agents)
             )
-            state_emb = encode_state_dict(new_env_state, env_state, cur_player_action)
+            state_emb = encode_state_dict(bert_params, new_env_state, env_state, cur_player_action)
             ts = Timestep(
                 state_emb=state_emb,
                 actions=actions,
@@ -316,7 +321,7 @@ def make_train(
                 obs, new_env_state, rewards, dones, infos = wrapped_env.batch_step(
                     rng_s, env_state, actions
                 )
-                new_state_emb = encode_state_dict(new_env_state, env_state, cur_player_action)
+                new_state_emb = encode_state_dict(bert_params, new_env_state, env_state, cur_player_action)
                 ts = Timestep(
                     state_emb=last_state_emb,
                     actions=actions,
@@ -337,7 +342,7 @@ def make_train(
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = wrapped_env.batch_reset(_rng)
             init_actions = jnp.full((config["NUM_ENVS"],), env.num_moves - 1, dtype=jnp.int32)
-            init_state_emb = encode_state_dict(env_state, env_state, init_actions)
+            init_state_emb = encode_state_dict(bert_params, env_state, env_state, init_actions)
             init_dones = {
                 a: jnp.zeros((config["NUM_ENVS"]), dtype=bool)
                 for a in env.agents + ["__all__"]
@@ -513,14 +518,14 @@ def make_train(
                 obs, new_env_state, rewards, dones, infos = test_env.batch_step(
                     key_s, env_state, actions
                 )
-                new_emb = encode_state_dict(new_env_state, env_state, cur_player_action)
+                new_emb = encode_state_dict(bert_params, new_env_state, env_state, cur_player_action)
                 step_state = (params, new_env_state, new_emb, dones, hs, rng)
                 return step_state, (rewards, dones, infos)
 
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = test_env.batch_reset(_rng)
             init_actions = jnp.full((config["TEST_NUM_ENVS"],), env.num_moves - 1, dtype=jnp.int32)
-            init_state_emb = encode_state_dict(env_state, env_state, init_actions)
+            init_state_emb = encode_state_dict(bert_params, env_state, env_state, init_actions)
             init_dones = {
                 a: jnp.zeros((config["TEST_NUM_ENVS"]), dtype=bool)
                 for a in env.agents + ["__all__"]
@@ -625,10 +630,11 @@ def single_run(config):
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_fn = make_train(
-        config, env, bert_module, bert_params, tokenize_fn, bert_hidden, action_emb
+        config, env, bert_module, tokenize_fn, bert_hidden, action_emb
     )
-    train_vjit = jax.jit(jax.vmap(train_fn))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    # bert_params threaded as a runtime arg, broadcast across the seed-vmap.
+    train_vjit = jax.jit(jax.vmap(train_fn, in_axes=(0, None)))
+    outs = jax.block_until_ready(train_vjit(rngs, bert_params))
 
     if config.get("SAVE_PATH", None) is not None:
         from jaxmarl.wrappers.baselines import save_params

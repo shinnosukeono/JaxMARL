@@ -3,12 +3,13 @@
 # (vdn=0, net=publ-lstm) but reframed for jaxmarl's vectorised loop.
 
 "TOTAL_TIMESTEPS": 5e8         # ~ 1000 epoch * 500 batchsize 64 * NUM_ENVS rollouts
-"NUM_ENVS": 1024
+"NUM_ENVS": 256                # tuned for one A100 40GB
 "NUM_STEPS": 80                # max episode length (max_len: 80 in original yaml)
-"BUFFER_SIZE": 50000
+# Buffer total mem ≈ NUM_ENVS * max_length * NUM_STEPS * per_field; keep small.
+"BUFFER_SIZE": 16384           # = NUM_ENVS * max_length=64
 "BUFFER_BATCH_SIZE": 64
 
-"HIDDEN_SIZE": 512
+"HIDDEN_SIZE": 256             # paper used 512; halved here to fit one 40GB A100
 "EPS_START": 0.1               # act_base_eps
 "EPS_FINISH": 0.001
 "EPS_DECAY": 0.1
