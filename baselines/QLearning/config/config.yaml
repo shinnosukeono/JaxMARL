@@ -12,3 +12,6 @@
 
 # where to save the params (if None, will not save)
 "SAVE_PATH": "models"
+
+# Python-loop driver: log metrics every N updates (only used by refactored scripts).
+"LOG_EVERY": 50

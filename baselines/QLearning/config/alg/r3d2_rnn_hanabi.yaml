@@ -1,5 +1,11 @@
 # R3D2 (DRRN-style text-action Q-learning) on Hanabi.
-# Mirrors r3d2.yaml from the upstream R3D2 repo (frozen BERT, 2 LM layers, hid 128).
+# Matches r3d2.yaml from the original R3D2 repo (chandar-lab):
+#   net=drrn-lstm, rnn_hid_dim=128, num_lm_layer=1 (1 BERT encoder layer),
+#   batchsize=64, replay_buffer_size=50000, lm_weights=pretrained.
+#
+# Original: 2000 epochs × 500 epoch_len = 1,000,000 gradient steps.
+# Our loop: NUM_UPDATES = 5e8 / 80 / 256 = 24,414.
+# NUM_EPOCHS=41 → 24,414 × 41 ≈ 1,001,000 gradient steps.
 
 "TOTAL_TIMESTEPS": 5e8
 "NUM_ENVS": 256
@@ -14,7 +20,7 @@
 "MAX_GRAD_NORM": 5.0
 "TARGET_UPDATE_INTERVAL": 2500
 "TAU": 1.0
-"NUM_EPOCHS": 1
+"NUM_EPOCHS": 41
 "LR": 6.25e-5
 "ADAM_EPS": 1.5e-5
 "LR_LINEAR_DECAY": False
@@ -23,7 +29,7 @@
 "MULTI_STEP": 1
 "REW_SCALE": 1.0
 
-# text encoders
+# text encoders (1-layer TinyBERT, matching original's num_lm_layer=1)
 "BERT_MODEL_DIR": "baselines/QLearning/pretrained_text/tinybert_l2_flax"
 "MAX_OBS_TOKENS": 256
 "MAX_ACTION_TOKENS": 12

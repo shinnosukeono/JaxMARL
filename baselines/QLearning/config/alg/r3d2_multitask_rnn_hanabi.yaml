@@ -1,5 +1,12 @@
 # Multi-task R3D2: train one network across 2,3,4,5-player Hanabi.
-# Mirrors r3d2-multitask.yaml + r3d2_main.py(--num_player 6) from the upstream repo.
+# Matches r3d2-multitask.yaml from the original R3D2 repo.
+#
+# Original: TOTAL_EPOCHS=4000 × epoch_len=500 = 2,000,000 gradient steps.
+# Our loop uses round-robin over player counts, so each update covers one
+# player count. With 4 player counts, ~500K updates per setting.
+# NUM_UPDATES = TOTAL_TIMESTEPS / NUM_STEPS / NUM_ENVS_PER_SETTING.
+# With 5e8 / 80 / 64 = 97,656 updates.
+# NUM_EPOCHS=21 → 97,656 × 21 ≈ 2,050,000 gradient steps total.
 
 "PLAYER_COUNTS": [2, 3, 4, 5]
 "NUM_ENVS_PER_SETTING": 64
@@ -15,7 +22,7 @@
 "MAX_GRAD_NORM": 5.0
 "TARGET_UPDATE_INTERVAL": 2500
 "TAU": 1.0
-"NUM_EPOCHS": 1
+"NUM_EPOCHS": 21
 "LR": 6.25e-5
 "ADAM_EPS": 1.5e-5
 "LEARNING_STARTS": 10000
@@ -23,7 +30,7 @@
 "MULTI_STEP": 1
 "REW_SCALE": 1.0
 
-# text encoders (shared across player counts, frozen)
+# text encoders (1-layer TinyBERT, matching original's num_lm_layer=1)
 "BERT_MODEL_DIR": "baselines/QLearning/pretrained_text/tinybert_l2_flax"
 "MAX_OBS_TOKENS": 256
 "MAX_ACTION_TOKENS": 12

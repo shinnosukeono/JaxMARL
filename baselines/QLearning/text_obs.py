@@ -261,14 +261,10 @@ def render_obs_for_agent(
             output += f"Scored: {int(feats['card_played_score'][0])}\n"
             output += f"Added Info: {int(feats['added_info_tokens'][0])}\n"
 
-    # legal actions for this agent
-    # env.get_legal_moves uses jnp ops internally — convert state leaves to jnp first.
-    from jaxmarl.environments.hanabi.hanabi_game import State
-    jnp_state = State(**{k: jnp.asarray(getattr(new_state, k)) for k in new_state.__dataclass_fields__})
-    legal_moves = np.asarray(env.get_legal_moves(jnp_state)[env.agents[aidx]])
-    legal_actions = [env.action_encoding[int(a)] for a in np.where(legal_moves)[0]]
-    output += f"Legal Actions: {legal_actions}\n"
-
+    # NOTE: the original R3D2 text obs does NOT include "Legal Actions:".
+    # We omit it both for fidelity and because computing it requires a JIT'd
+    # JAX call (env.get_legal_moves) per (env, agent), which dominated rollout
+    # cost when this function runs inside a pure_callback at every scan step.
     return output
 
 
@@ -334,30 +330,35 @@ def make_tokenize_fn(
         last_actions = np.asarray(last_actions)
         B = last_actions.shape[0]
 
-        # Reconstruct dict of leaves -> per-batch index
         new_field_dict = {k: np.asarray(v) for k, v in state_leaves.items()}
         old_field_dict = {k: np.asarray(v) for k, v in old_state_leaves.items()}
 
-        ids_out = np.full((num_agents, B, max_obs_tokens), pad_id, dtype=np.int32)
-        mask_out = np.zeros((num_agents, B, max_obs_tokens), dtype=np.int32)
-
+        # Build all (B * num_agents) text observations first, then tokenize the
+        # whole list in a single HF call. Per-string tokenizer calls in a Python
+        # loop are ~50x slower than batch mode, which dominated rollout cost.
+        texts = [None] * (num_agents * B)
         for b in range(B):
             new_s = State(**{k: v[b] for k, v in new_field_dict.items()})
             old_s = State(**{k: v[b] for k, v in old_field_dict.items()})
             for ai in range(num_agents):
-                txt = render_obs_for_agent(
+                texts[ai * B + b] = render_obs_for_agent(
                     env, new_s, old_s, int(last_actions[b]), ai,
                     include_belief=include_belief,
                 )
-                enc = tokenizer(
-                    txt,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=max_obs_tokens,
-                    return_tensors="np",
-                )
-                ids_out[ai, b] = enc["input_ids"][0]
-                mask_out[ai, b] = enc["attention_mask"][0]
+
+        enc = tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_obs_tokens,
+            return_tensors="np",
+        )
+        ids_out = np.asarray(enc["input_ids"], dtype=np.int32).reshape(
+            num_agents, B, max_obs_tokens
+        )
+        mask_out = np.asarray(enc["attention_mask"], dtype=np.int32).reshape(
+            num_agents, B, max_obs_tokens
+        )
         return ids_out, mask_out
 
     def call(new_state, old_state, last_actions):

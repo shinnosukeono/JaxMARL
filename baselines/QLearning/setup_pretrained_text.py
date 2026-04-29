@@ -6,6 +6,11 @@ The text-based baselines (r2d2_text, r3d2, r3d2_multitask, obl) reference
 weights. The conversion needs CPU torch + HF transformers; we don't ship the
 binary weights in git.
 
+The original R3D2 repo uses ``deleteEncodingLayers()`` to keep only 1 of
+TinyBERT-L-2's 2 encoder layers (controlled by ``num_lm_layer``). We
+reproduce that here: after loading the full 2-layer model, we strip it to
+1 encoder layer by modifying the config and pruning ``params["encoder"]``.
+
 Usage:
     python baselines/QLearning/setup_pretrained_text.py
 
@@ -15,8 +20,13 @@ folder automatically.
 
 from __future__ import annotations
 
+import copy
+import json
 import os
 import sys
+
+
+NUM_ENCODER_LAYERS_TO_KEEP = 1
 
 
 def main():
@@ -27,7 +37,7 @@ def main():
     os.makedirs(target, exist_ok=True)
 
     try:
-        from transformers import AutoTokenizer, FlaxBertModel  # noqa: F401
+        from transformers import AutoTokenizer, FlaxBertModel, BertConfig  # noqa: F401
     except ImportError:
         sys.exit(
             "transformers is not installed in this venv. "
@@ -44,14 +54,31 @@ def main():
             "--index-url https://download.pytorch.org/whl/cpu` first."
         )
 
-    print("Loading cross-encoder/ms-marco-TinyBERT-L-2-v2 …")
+    print("Loading cross-encoder/ms-marco-TinyBERT-L-2-v2 (full 2-layer) …")
     tok = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-TinyBERT-L-2-v2")
     model = FlaxBertModel.from_pretrained(
         "cross-encoder/ms-marco-TinyBERT-L-2-v2", from_pt=True
     )
 
+    orig_layers = model.config.num_hidden_layers
+    keep = NUM_ENCODER_LAYERS_TO_KEEP
+    print(f"Stripping encoder layers: {orig_layers} → {keep} "
+          f"(matching original R3D2 deleteEncodingLayers)")
+
+    # Prune encoder layer params: keep only layer indices [0, keep).
+    new_params = copy.deepcopy(model.params)
+    encoder_layers = new_params["encoder"]["layer"]
+    pruned_layers = {str(i): encoder_layers[str(i)] for i in range(keep)}
+    new_params["encoder"]["layer"] = pruned_layers
+
+    # Save with updated config.
+    new_config = copy.deepcopy(model.config)
+    new_config.num_hidden_layers = keep
+    new_model = FlaxBertModel(new_config)
+    new_model.params = new_params
+
     tok.save_pretrained(target)
-    model.save_pretrained(target)
+    new_model.save_pretrained(target)
     print(f"Cached to {target}")
     print("Files:", sorted(os.listdir(target)))
 

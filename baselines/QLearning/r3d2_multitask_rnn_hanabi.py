@@ -54,7 +54,7 @@ from r3d2_rnn_hanabi import (
     R3D2Net, ScannedLSTM, Timestep, CustomTrainState,
     load_bert, precompute_action_embedding,
 )
-from text_obs import make_tokenize_fn
+from text_obs_jax import make_tokenize_fn_jax as make_tokenize_fn
 
 
 # ---------------------------------------------------------------------------
