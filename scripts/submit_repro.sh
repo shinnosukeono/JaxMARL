@@ -21,6 +21,13 @@ SCRIPTS_DIR="${PROJECT_DIR}/scripts"
 JOBS_DIR="${SCRIPTS_DIR}/jobs"
 mkdir -p "${JOBS_DIR}"
 
+# Auto-source .env at project root so WANDB_API_KEY (and any other secrets)
+# are picked up without the caller needing to remember to source them.
+if [[ -f "${PROJECT_DIR}/.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${PROJECT_DIR}/.env"
+fi
+
 # Defaults
 QUEUE="regular-g"
 WALLTIME="24:00:00"

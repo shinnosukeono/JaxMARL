@@ -32,3 +32,6 @@ scripts/jobs/
 
 # claude-code session metadata
 .claude/
+
+# Local env (wandb keys etc.)
+.env
