@@ -41,8 +41,8 @@ from jaxmarl.wrappers.baselines import LogWrapper, CTRolloutManager
 
 from obl_belief_model import ARBeliefModel, loss_fn, make_ar_input
 from r2d2_publ_rnn_hanabi import (
-    PublicLSTMQNetwork, ScannedLSTM as PublScannedLSTM,
-    hanabi_publ_split, hanabi_feature_widths, reorder_obs_for_split,
+    PublicLSTMQNetwork,
+    hanabi_hands_dim, hanabi_feature_widths,
 )
 
 
@@ -132,10 +132,11 @@ def make_train(config, env, bp_policy=None):
                 ks, env_state, actions
             )
 
-            # priv_s per agent: re-order CTRolloutManager-padded obs.
-            priv_s = jnp.stack([
-                reorder_obs_for_split(obs[a], widths) for a in env.agents
-            ], axis=0)  # (num_agents, NUM_ENVS, in_dim)
+            # priv_s per agent: full obs (the belief encoder takes the
+            # complete observation, mirroring upstream pyhanabi/train_belief).
+            # JaxMARL's obs is already in canonical order so no reorder.
+            priv_s = jnp.stack([obs[a] for a in env.agents], axis=0)
+            # shape: (num_agents, NUM_ENVS, in_dim)
 
             # own_hand per agent: ground truth, from env's State.
             own = encode_own_hand(

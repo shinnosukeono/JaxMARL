@@ -39,7 +39,9 @@ from other_play import OtherPlayState, op_init, op_resample, op_permute_obs, op_
 
 
 class ScannedLSTM(nn.Module):
-    """LSTM over a (time, batch, dim) sequence with per-step `resets` flag."""
+    """Single-layer LSTM scanned over a (time, batch, dim) sequence with
+    per-step `resets` flag. Kept for use by the text/R3D2/multitask networks
+    that don't need a 2-layer stack."""
 
     @partial(
         nn.scan,
@@ -68,19 +70,85 @@ class ScannedLSTM(nn.Module):
         )
 
 
+class MultiLayerScannedLSTM(nn.Module):
+    """`num_layers`-deep LSTM scanned over time with per-step resets.
+
+    Mirrors PyTorch `nn.LSTM(hid_dim, hid_dim, num_layers=num_layers)` used
+    in upstream R3D2 (`pyhanabi/q_net.py:349` PublicLSTMNet,
+    `pyhanabi/belief_model.py:47` ARBeliefModel). Carry layout matches the
+    JaxMARL OBL Flax loader at
+    `jaxmarl/environments/hanabi/pretrained/obl_r2d2_agent.py:MultiLayerLSTM`:
+        carry = (c_stack, h_stack), each shape (num_layers, *batch, hidden).
+    Per-step reset zeroes all layers' carries on `dones=True`.
+    """
+
+    num_layers: int = 2
+
+    @partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry, x):
+        ins, resets = x
+        zeros = jax.tree.map(jnp.zeros_like, carry)
+        # Broadcast resets to leading layer dim and trailing hidden dim.
+        reset_mask = resets[None, ..., None]
+        carry = jax.tree.map(
+            lambda c, z: jnp.where(reset_mask, z, c),
+            carry,
+            zeros,
+        )
+        hidden_size = ins.shape[-1]
+        new_cs, new_hs = [], []
+        y = ins
+        for layer in range(self.num_layers):
+            layer_carry = jax.tree.map(lambda x, _l=layer: x[_l], carry)
+            new_layer_carry, y = nn.OptimizedLSTMCell(
+                hidden_size, name=f"l{layer}"
+            )(layer_carry, y)
+            new_cs.append(new_layer_carry[0])
+            new_hs.append(new_layer_carry[1])
+        new_carry = (jnp.stack(new_cs), jnp.stack(new_hs))
+        return new_carry, y
+
+    @staticmethod
+    def initialize_carry(hidden_size, num_layers, *batch_size):
+        mem_shape = (num_layers, *batch_size, hidden_size)
+        return (jnp.zeros(mem_shape), jnp.zeros(mem_shape))
+
+
 class PublicLSTMQNetwork(nn.Module):
-    """Public/private LSTM dueling Q-network."""
+    """Public/private LSTM dueling Q-network.
+
+    Precise port of `PublicLSTMNet` in upstream R3D2's
+    `pyhanabi/q_net.py:321`. Architecture:
+        priv_net : 3 × (Linear + ReLU)
+        publ_net : 1 × (Linear + ReLU)
+        lstm     : nn.LSTM(hid_dim, hid_dim, num_layers=num_lstm_layer)
+        head     : fc_v(1) + fc_a(out_dim) — combined as q = v + a
+                   (functionally equivalent to upstream's
+                    q = v + a*legal_move for any legal action; illegal
+                    actions are masked separately by the trainer/eval).
+    Default `num_lstm_layer=2` matches `r2d2_main.py:69` upstream.
+
+    Slicing convention matches the upstream OBL loader at
+    `jaxmarl/environments/hanabi/pretrained/obl_r2d2_agent.py`:
+        priv_s = full obs                 (priv MLP sees everything)
+        publ_s = obs[..., hands_dim:]     (public LSTM sees obs minus
+                                           the partner-cards block)
+    """
 
     action_dim: int
     hidden_dim: int
-    publ_split: int
+    num_lstm_layer: int = 2
     init_scale: float = 1.0
 
     @nn.compact
-    def __call__(self, hidden, obs, dones):
-        priv_s = obs[..., : self.publ_split]
-        publ_s = obs[..., self.publ_split :]
-
+    def __call__(self, hidden, priv_s, publ_s, dones):
         priv_o = nn.Dense(self.hidden_dim,
             kernel_init=orthogonal(self.init_scale), bias_init=constant(0.0))(priv_s)
         priv_o = nn.relu(priv_o)
@@ -96,7 +164,9 @@ class PublicLSTMQNetwork(nn.Module):
         publ_x = nn.relu(publ_x)
 
         rnn_in = (publ_x, dones)
-        hidden, publ_o = ScannedLSTM()(hidden, rnn_in)
+        hidden, publ_o = MultiLayerScannedLSTM(num_layers=self.num_lstm_layer)(
+            hidden, rnn_in
+        )
 
         o = priv_o * publ_o
 
@@ -105,6 +175,12 @@ class PublicLSTMQNetwork(nn.Module):
         a = nn.Dense(self.action_dim,
             kernel_init=orthogonal(self.init_scale), bias_init=constant(0.0))(o)
         return hidden, v + a
+
+    @staticmethod
+    def initialize_carry(hidden_size, num_lstm_layer, *batch_size):
+        return MultiLayerScannedLSTM.initialize_carry(
+            hidden_size, num_lstm_layer, *batch_size
+        )
 
 
 @chex.dataclass(frozen=True)
@@ -134,31 +210,30 @@ def hanabi_feature_widths(env):
     )
 
 
-def hanabi_publ_split(env):
-    w = hanabi_feature_widths(env)
-    priv_dim = w["hands"] + w["last_action"] + w["belief"] + w["agent_id"]
-    publ_dim = w["board"] + w["discard"]
-    return priv_dim, publ_dim
+def hanabi_hands_dim(env):
+    """Number of leading obs features that contain the partner-hand block —
+    the only genuinely private slice of the JaxMARL Hanabi obs.
 
-
-def reorder_obs_for_split(obs, widths):
-    h = widths["hands"]
-    b = widths["board"]
-    d = widths["discard"]
-    la = widths["last_action"]
-    bel = widths["belief"]
-    aid = widths["agent_id"]
-
-    hands = obs[..., :h]
-    board = obs[..., h : h + b]
-    discard = obs[..., h + b : h + b + d]
-    last_action = obs[..., h + b + d : h + b + d + la]
-    belief = obs[..., h + b + d + la : h + b + d + la + bel]
-    agent_id = obs[..., h + b + d + la + bel : h + b + d + la + bel + aid]
-
-    return jnp.concatenate(
-        [hands, last_action, belief, agent_id, board, discard], axis=-1
+    Matches the cut used by the upstream OBL loader at
+    `jaxmarl/environments/hanabi/pretrained/obl_r2d2_agent.py:greedy_act`,
+    which slices `publ_s = obs[..., 125:]` for 2p (i.e. excludes only the
+    `(num_agents-1) * hand_size * num_colors * num_ranks` partner-cards
+    block). The remaining JaxMARL `hands_n_feats` dims (per-agent
+    missing-card flags) are public and end up in the publ stream.
+    """
+    return int(
+        (env.num_agents - 1) * env.hand_size * env.num_colors * env.num_ranks
     )
+
+
+def split_obs_publ_priv(obs, hands_dim: int):
+    """Slice an obs tensor into (priv_s, publ_s) per the upstream convention.
+
+    The JaxMARL Hanabi obs (after CTRolloutManager appends agent_id) is laid
+    out as `[hands | board | discard | last_action | belief | agent_id]`, so
+    no reordering is needed — only a slice. priv_s is the *full* obs.
+    """
+    return obs, obs[..., hands_dim:]
 
 
 def make_train(config, env):
@@ -177,9 +252,11 @@ def make_train(config, env):
     multi_step = int(config.get("MULTI_STEP", 1))
     gamma = float(config["GAMMA"])
 
-    priv_dim, publ_dim = hanabi_publ_split(env)
     feat_widths = hanabi_feature_widths(env)
-    obs_dim = priv_dim + publ_dim
+    hands_dim = hanabi_hands_dim(env)
+    obs_dim = sum(feat_widths.values())
+    publ_dim = obs_dim - hands_dim
+    num_lstm_layer = int(config.get("NUM_LSTM_LAYER", 2))
 
     wrapped_env = CTRolloutManager(env, batch_size=config["NUM_ENVS"])
     test_env = CTRolloutManager(env, batch_size=config["TEST_NUM_ENVS"])
@@ -187,7 +264,7 @@ def make_train(config, env):
     network = PublicLSTMQNetwork(
         action_dim=wrapped_env.max_action_space,
         hidden_dim=config["HIDDEN_SIZE"],
-        publ_split=priv_dim,
+        num_lstm_layer=num_lstm_layer,
     )
 
     buffer = fbx.make_trajectory_buffer(
@@ -228,10 +305,9 @@ def make_train(config, env):
         return {a: x[i] for i, a in enumerate(env.agents)}
 
     def reorder_obs_dict(obs_dict):
-        out = {a: reorder_obs_for_split(obs_dict[a], feat_widths) for a in env.agents}
-        if "__all__" in obs_dict:
-            out["__all__"] = obs_dict["__all__"]
-        return out
+        # JaxMARL's Hanabi obs is already laid out so that the priv/publ split
+        # is a simple slice (`obs[..., hands_dim:]`); no reordering needed.
+        return obs_dict
 
     def _identity_op_state(num_envs):
         return OtherPlayState(
@@ -250,12 +326,13 @@ def make_train(config, env):
         rng, _rng = jax.random.split(rng)
 
         def create_agent(rng):
-            init_x = (
-                jnp.zeros((1, 1, obs_dim)),
-                jnp.zeros((1, 1)),
+            init_priv = jnp.zeros((1, 1, obs_dim))
+            init_publ = jnp.zeros((1, 1, publ_dim))
+            init_dones = jnp.zeros((1, 1))
+            init_hs = MultiLayerScannedLSTM.initialize_carry(
+                config["HIDDEN_SIZE"], num_lstm_layer, 1
             )
-            init_hs = ScannedLSTM.initialize_carry(config["HIDDEN_SIZE"], 1)
-            params = network.init(rng, init_hs, *init_x)
+            params = network.init(rng, init_hs, init_priv, init_publ, init_dones)
 
             lr_scheduler = optax.linear_schedule(
                 init_value=config["LR"],
@@ -318,9 +395,10 @@ def make_train(config, env):
             rng, rng_a, rng_s, rng_op = jax.random.split(rng, 4)
             _obs = batchify(last_obs)[:, np.newaxis]
             _dones = batchify(last_dones)[:, np.newaxis]
+            _priv, _publ = split_obs_publ_priv(_obs, hands_dim)
 
-            new_hs, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
-                train_state.params, hs, _obs, _dones
+            new_hs, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+                train_state.params, hs, _priv, _publ, _dones
             )
             q_vals = q_vals.squeeze(axis=1)
 
@@ -371,8 +449,8 @@ def make_train(config, env):
             a: jnp.zeros((config["NUM_ENVS"]), dtype=bool)
             for a in env.agents + ["__all__"]
         }
-        init_hs = ScannedLSTM.initialize_carry(
-            config["HIDDEN_SIZE"], len(env.agents), config["NUM_ENVS"]
+        init_hs = MultiLayerScannedLSTM.initialize_carry(
+            config["HIDDEN_SIZE"], num_lstm_layer, len(env.agents), config["NUM_ENVS"]
         )
         expl_state = (init_hs, init_obs, init_dones, env_state, op_state)
         rng, _rng = jax.random.split(rng)
@@ -397,22 +475,24 @@ def make_train(config, env):
                 lambda x: jnp.swapaxes(x[:, 0], 0, 1), minibatch
             )
 
-            init_hs_l = ScannedLSTM.initialize_carry(
-                config["HIDDEN_SIZE"], len(env.agents), config["BUFFER_BATCH_SIZE"],
+            init_hs_l = MultiLayerScannedLSTM.initialize_carry(
+                config["HIDDEN_SIZE"], num_lstm_layer,
+                len(env.agents), config["BUFFER_BATCH_SIZE"],
             )
             _obs = batchify(minibatch.obs)
             _dones = batchify(minibatch.dones)
             _actions = batchify(minibatch.actions)
             _rewards = batchify(minibatch.rewards)
             _avail = batchify(minibatch.avail_actions)
+            _priv, _publ = split_obs_publ_priv(_obs, hands_dim)
 
-            _, q_next_target = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
-                train_state.target_network_params, init_hs_l, _obs, _dones
+            _, q_next_target = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+                train_state.target_network_params, init_hs_l, _priv, _publ, _dones
             )
 
             def _loss_fn(params):
-                _, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
-                    params, init_hs_l, _obs, _dones
+                _, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+                    params, init_hs_l, _priv, _publ, _dones
                 )
                 chosen = jnp.take_along_axis(
                     q_vals, _actions[..., None], axis=-1
@@ -508,8 +588,9 @@ def make_train(config, env):
             rng, key_s = jax.random.split(rng)
             _obs = batchify(last_obs)[:, np.newaxis]
             _dones = batchify(last_dones)[:, np.newaxis]
-            hs, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
-                params, hs, _obs, _dones
+            _priv, _publ = split_obs_publ_priv(_obs, hands_dim)
+            hs, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+                params, hs, _priv, _publ, _dones
             )
             q_vals = q_vals.squeeze(axis=1)
             valid = test_env.get_valid_actions(env_state.env_state)
@@ -530,8 +611,9 @@ def make_train(config, env):
             for a in env.agents + ["__all__"]
         }
         rng, _rng = jax.random.split(rng)
-        hs = ScannedLSTM.initialize_carry(
-            config["HIDDEN_SIZE"], len(env.agents), config["TEST_NUM_ENVS"]
+        hs = MultiLayerScannedLSTM.initialize_carry(
+            config["HIDDEN_SIZE"], num_lstm_layer,
+            len(env.agents), config["TEST_NUM_ENVS"]
         )
         step_state = (params, env_state, init_obs, init_dones, hs, _rng)
         step_state, (rewards, dones, infos) = jax.lax.scan(

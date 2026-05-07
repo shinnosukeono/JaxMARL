@@ -47,11 +47,14 @@ import wandb
 from omegaconf import OmegaConf
 
 from jaxmarl import make
-from jaxmarl.wrappers.baselines import LogWrapper, CTRolloutManager
+from jaxmarl.wrappers.baselines import LogWrapper, CTRolloutManager, load_params
 
 from r2d2_publ_rnn_hanabi import (
-    PublicLSTMQNetwork, ScannedLSTM,
-    hanabi_publ_split, hanabi_feature_widths, reorder_obs_for_split,
+    PublicLSTMQNetwork,
+    MultiLayerScannedLSTM,
+    hanabi_hands_dim,
+    hanabi_feature_widths,
+    split_obs_publ_priv,
     CustomTrainState,
 )
 from obl_belief_model import ARBeliefModel, make_ar_input  # noqa: F401
@@ -64,8 +67,8 @@ from obl_belief_model import ARBeliefModel, make_ar_input  # noqa: F401
 
 @chex.dataclass(frozen=True)
 class OBLTimestep:
-    obs: dict           # per-agent reordered obs (jnp at time t, shape (B, in_dim))
-    target_obs: dict    # per-agent reordered fictitious obs at t+1 (post own-hand sample)
+    obs: dict  # per-agent reordered obs (jnp at time t, shape (B, in_dim))
+    target_obs: dict  # per-agent reordered fictitious obs at t+1 (post own-hand sample)
     actions: dict
     rewards: dict
     dones: dict
@@ -89,7 +92,9 @@ def _ints_to_card_matrices(idx, num_colors, num_ranks, orig_hand):
     return jnp.where(empty[:, None, None], jnp.zeros_like(one_hot), one_hot)
 
 
-def replace_own_hand_per_env(state, agent_idx_int, fict_hand_ints, num_colors, num_ranks):
+def replace_own_hand_per_env(
+    state, agent_idx_int, fict_hand_ints, num_colors, num_ranks
+):
     """state: single Hanabi State (no batch dim).
     agent_idx_int: scalar int.
     fict_hand_ints: (hand_size,) int32.
@@ -106,7 +111,9 @@ def replace_own_hand_per_env(state, agent_idx_int, fict_hand_ints, num_colors, n
 # ---------------------------------------------------------------------------
 
 
-def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[Any], hidden_dim: int):
+def make_train(
+    config, env, bp_params: Optional[Any], belief_params: Optional[Any], hidden_dim: int
+):
     NUM_ENVS = int(config["NUM_ENVS"])
     NUM_STEPS = int(config["NUM_STEPS"])
     BUFFER_SIZE = int(config["BUFFER_SIZE"])
@@ -124,10 +131,12 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
     tau = float(config["TAU"])
     num_belief_samples = int(config.get("NUM_BELIEF_SAMPLES", 1))
     assert num_belief_samples == 1, "Only NUM_BELIEF_SAMPLES=1 supported in this stub."
+    num_lstm_layer = int(config.get("NUM_LSTM_LAYER", 2))
 
     widths = hanabi_feature_widths(env)
     in_dim = sum(widths.values())
-    priv_dim, _ = hanabi_publ_split(env)
+    hands_dim = hanabi_hands_dim(env)
+    publ_dim = in_dim - hands_dim
     num_colors = env.num_colors
     num_ranks = env.num_ranks
     hand_size = env.hand_size
@@ -136,20 +145,25 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
     # ---- networks ----
     online_net = PublicLSTMQNetwork(
         action_dim=CTRolloutManager(env, batch_size=1).max_action_space,
-        hidden_dim=HID, publ_split=priv_dim,
+        hidden_dim=HID,
+        num_lstm_layer=num_lstm_layer,
     )
     bp_net = PublicLSTMQNetwork(
         action_dim=CTRolloutManager(env, batch_size=1).max_action_space,
-        hidden_dim=HID, publ_split=priv_dim,
+        hidden_dim=HID,
+        num_lstm_layer=num_lstm_layer,
     )
     belief = ARBeliefModel(
-        in_dim=in_dim, hid_dim=HID, hand_size=hand_size,
+        in_dim=in_dim,
+        hid_dim=HID,
+        hand_size=hand_size,
         out_dim=num_colors * num_ranks,
     )
 
     NUM_UPDATES = TOTAL // NUM_STEPS // NUM_ENVS
     eps_scheduler = optax.linear_schedule(
-        init_value=eps_start, end_value=eps_finish,
+        init_value=eps_start,
+        end_value=eps_finish,
         transition_steps=eps_decay * NUM_UPDATES,
     )
 
@@ -161,9 +175,9 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
         greedy = get_greedy(q, avail)
         probs = avail / jnp.clip(avail.sum(axis=-1, keepdims=True), a_min=1.0)
         rngs_ = jax.random.split(ra, avail.shape[0])
-        rand = jax.vmap(lambda r, p: jax.random.choice(r, jnp.arange(p.shape[-1]), p=p))(
-            rngs_, probs
-        )
+        rand = jax.vmap(
+            lambda r, p: jax.random.choice(r, jnp.arange(p.shape[-1]), p=p)
+        )(rngs_, probs)
         return jnp.where(jax.random.uniform(re, greedy.shape) < eps, rand, greedy)
 
     def batchify(d):
@@ -173,10 +187,11 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
         return {a: x[i] for i, a in enumerate(env.agents)}
 
     def reorder_obs_dict(obs):
-        out = {a: reorder_obs_for_split(obs[a], widths) for a in env.agents}
-        if "__all__" in obs:
-            out["__all__"] = obs["__all__"]
-        return out
+        # JaxMARL Hanabi obs is already in canonical order
+        # ([hands | board | discard | last_action | belief | agent_id]); the
+        # priv/publ split is a slice. Kept as a no-op identity for symmetry
+        # with the rest of the codebase.
+        return obs
 
     def sample_fict_hand(rng, priv_s_t):
         """Sample a fictitious own-hand from the belief model.
@@ -186,10 +201,12 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
         if belief_params is None:
             # Uniform-random belief (smoke / no belief model loaded).
             return jax.random.randint(
-                rng, (priv_s_t.shape[0], hand_size),
-                minval=0, maxval=num_colors * num_ranks,
+                rng,
+                (priv_s_t.shape[0], hand_size),
+                minval=0,
+                maxval=num_colors * num_ranks,
             )
-        priv = priv_s_t[None, :]                # (T=1, B, in_dim)
+        priv = priv_s_t[None, :]  # (T=1, B, in_dim)
         dones = jnp.zeros((1, priv_s_t.shape[0]))
         zero_card = jnp.zeros((1, priv_s_t.shape[0], hand_size, num_colors * num_ranks))
         # Note: this samples slots independently from marginal logits — true AR
@@ -219,18 +236,25 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             return env.get_obs(new_state, state_t_inner, act)
 
         obs_dict = jax.vmap(per_env)(
-            env_state_t1.env_state, env_state_t.env_state, cur_player, fict_hands, action_t
+            env_state_t1.env_state,
+            env_state_t.env_state,
+            cur_player,
+            fict_hands,
+            action_t,
         )
 
-        # Mimic CTRolloutManager._preprocess_obs: append agent-id one-hot, then reorder.
+        # Mimic CTRolloutManager._preprocess_obs: append agent-id one-hot.
+        # No reordering is needed — the JaxMARL Hanabi obs is already in
+        # canonical order for the priv/publ slice convention.
         agents_oh = jnp.eye(num_agents)
         out = {}
         for i, a in enumerate(env.agents):
             o = obs_dict[a]
             o = jnp.concatenate(
-                [o, jnp.broadcast_to(agents_oh[i], (o.shape[0], num_agents))], axis=-1,
+                [o, jnp.broadcast_to(agents_oh[i], (o.shape[0], num_agents))],
+                axis=-1,
             )
-            out[a] = reorder_obs_for_split(o, widths)
+            out[a] = o
         return out
 
     def train(rng):
@@ -238,9 +262,11 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
 
         # ---- params (init online from BP if compatible, else fresh) ----
         rng, _rng = jax.random.split(rng)
-        init_x = (jnp.zeros((1, 1, in_dim)), jnp.zeros((1, 1)))
-        init_hs = ScannedLSTM.initialize_carry(HID, 1)
-        params = online_net.init(_rng, init_hs, *init_x)
+        init_priv = jnp.zeros((1, 1, in_dim))
+        init_publ = jnp.zeros((1, 1, publ_dim))
+        init_dones = jnp.zeros((1, 1))
+        init_hs = MultiLayerScannedLSTM.initialize_carry(HID, num_lstm_layer, 1)
+        params = online_net.init(_rng, init_hs, init_priv, init_publ, init_dones)
         if bp_params is not None:
             try:
                 jax.tree.map(lambda a, b: a + 0 * b, params, bp_params)
@@ -255,7 +281,10 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             optax.adam(learning_rate=LR, eps=config.get("ADAM_EPS", 1.5e-5)),
         )
         train_state = CustomTrainState.create(
-            apply_fn=online_net.apply, params=params, target_network_params=params, tx=tx,
+            apply_fn=online_net.apply,
+            params=params,
+            target_network_params=params,
+            tx=tx,
         )
 
         # ---- rollout step ----
@@ -265,8 +294,13 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
 
             _obs = batchify(last_obs)[:, np.newaxis]  # (n_agents, 1, B, in_dim)
             _dones = batchify(last_dones)[:, np.newaxis]
-            new_hs, q_vals = jax.vmap(online_net.apply, in_axes=(None, 0, 0, 0))(
-                train_state.params, hs, _obs, _dones,
+            _priv, _publ = split_obs_publ_priv(_obs, hands_dim)
+            new_hs, q_vals = jax.vmap(online_net.apply, in_axes=(None, 0, 0, 0, 0))(
+                train_state.params,
+                hs,
+                _priv,
+                _publ,
+                _dones,
             )
             q_vals = q_vals.squeeze(axis=1)
             avail = wrapped_env.get_valid_actions(env_state.env_state)
@@ -277,7 +311,8 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             )
             actions = unbatchify(actions)
             cur_player_action = sum(
-                actions[a] * env_state.env_state.cur_player_idx[..., i].astype(jnp.int32)
+                actions[a]
+                * env_state.env_state.cur_player_idx[..., i].astype(jnp.int32)
                 for i, a in enumerate(env.agents)
             )
             obs, new_env_state, rewards, dones, infos = wrapped_env.batch_step(
@@ -285,19 +320,19 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             )
             obs = reorder_obs_dict(obs)
 
-            # Fictitious target obs.
+            # Fictitious target obs: gather the cur player's full obs at t,
+            # which the belief model conditions on to sample a fictitious hand.
             cur_idx = jnp.argmax(env_state.env_state.cur_player_idx, axis=-1)  # (B,)
-            priv_per_agent = batchify(last_obs)[..., :priv_dim]  # (n_agents, B, priv_dim)
-            priv_cur = jax.vmap(lambda p, i: p[:, i, :], in_axes=(0, 0))(  # noqa: E501
-                priv_per_agent.transpose(1, 0, 2)[None], cur_idx[None],
-            )[0]  # (B, priv_dim)
-            # Actually we want priv obs of cur player at t -> use last_obs reordered.
             priv_cur = jax.vmap(lambda obs_, i: obs_[i])(
-                jnp.stack([last_obs[a] for a in env.agents], axis=1),  # (B, n_agents, in_dim)
+                jnp.stack(
+                    [last_obs[a] for a in env.agents], axis=1
+                ),  # (B, n_agents, in_dim)
                 cur_idx,
-            )
+            )  # (B, in_dim)
 
-            target_obs = make_target_obs(new_env_state, env_state, cur_player_action, rb, priv_cur)
+            target_obs = make_target_obs(
+                new_env_state, env_state, cur_player_action, rb, priv_cur
+            )
 
             ts = OBLTimestep(
                 obs=last_obs,
@@ -308,23 +343,40 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
                 avail_actions=avail,
             )
             return (
-                new_hs, obs, dones, new_env_state, env_state, cur_player_action, rng,
+                new_hs,
+                obs,
+                dones,
+                new_env_state,
+                env_state,
+                cur_player_action,
+                rng,
             ), (ts, infos)
 
         def _initial_state(rng):
             rng, k = jax.random.split(rng)
             init_obs, env_state = wrapped_env.batch_reset(k)
             init_obs = reorder_obs_dict(init_obs)
-            init_dones = {a: jnp.zeros((NUM_ENVS,), dtype=bool)
-                          for a in env.agents + ["__all__"]}
+            init_dones = {
+                a: jnp.zeros((NUM_ENVS,), dtype=bool) for a in env.agents + ["__all__"]
+            }
             init_actions = jnp.full((NUM_ENVS,), env.num_moves - 1, dtype=jnp.int32)
-            init_hs = ScannedLSTM.initialize_carry(HID, num_agents, NUM_ENVS)
+            init_hs = MultiLayerScannedLSTM.initialize_carry(HID, num_lstm_layer, num_agents, NUM_ENVS)
             return rng, init_hs, init_obs, init_dones, env_state, init_actions
 
         # Build a sample trajectory to init flashbax buffer.
-        rng, init_hs, init_obs, init_dones, env_state, init_actions = _initial_state(rng)
+        rng, init_hs, init_obs, init_dones, env_state, init_actions = _initial_state(
+            rng
+        )
         rng, _rng = jax.random.split(rng)
-        carry0 = (init_hs, init_obs, init_dones, env_state, env_state, init_actions, _rng)
+        carry0 = (
+            init_hs,
+            init_obs,
+            init_dones,
+            env_state,
+            env_state,
+            init_actions,
+            _rng,
+        )
         _, (sample_traj, _) = jax.lax.scan(_step_env, carry0, None, NUM_STEPS)
 
         sample_unbatched = jax.tree.map(lambda x: x[:, 0], sample_traj)
@@ -345,16 +397,26 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             rng, k2 = jax.random.split(rng)
             init_obs_, init_env_state = wrapped_env.batch_reset(k2)
             init_obs_ = reorder_obs_dict(init_obs_)
-            init_dones_ = {a: jnp.zeros((NUM_ENVS,), dtype=bool)
-                           for a in env.agents + ["__all__"]}
+            init_dones_ = {
+                a: jnp.zeros((NUM_ENVS,), dtype=bool) for a in env.agents + ["__all__"]
+            }
             init_actions_ = jnp.full((NUM_ENVS,), env.num_moves - 1, dtype=jnp.int32)
-            init_hs_ = ScannedLSTM.initialize_carry(HID, num_agents, NUM_ENVS)
+            init_hs_ = MultiLayerScannedLSTM.initialize_carry(HID, num_lstm_layer, num_agents, NUM_ENVS)
             rng, _rng = jax.random.split(rng)
 
             (final_carry, (timesteps, infos)) = jax.lax.scan(
                 _step_env,
-                (init_hs_, init_obs_, init_dones_, init_env_state, init_env_state, init_actions_, _rng),
-                None, NUM_STEPS,
+                (
+                    init_hs_,
+                    init_obs_,
+                    init_dones_,
+                    init_env_state,
+                    init_env_state,
+                    init_actions_,
+                    _rng,
+                ),
+                None,
+                NUM_STEPS,
             )
 
             train_state = train_state.replace(
@@ -374,17 +436,23 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
                     lambda x: jnp.swapaxes(x[:, 0], 0, 1), minibatch
                 )
 
-                init_hs_l = ScannedLSTM.initialize_carry(HID, num_agents, BATCH)
+                init_hs_l = MultiLayerScannedLSTM.initialize_carry(HID, num_lstm_layer, num_agents, BATCH)
                 _obs = batchify(minibatch.obs)
                 _target_obs = batchify(minibatch.target_obs)
                 _dones = batchify(minibatch.dones)
                 _actions = batchify(minibatch.actions)
                 _rewards = batchify(minibatch.rewards)
                 _avail = batchify(minibatch.avail_actions)
+                _priv, _publ = split_obs_publ_priv(_obs, hands_dim)
+                _t_priv, _t_publ = split_obs_publ_priv(_target_obs, hands_dim)
 
                 # BP forward on fictitious next-obs.
-                _, q_bp_target = jax.vmap(bp_net.apply, in_axes=(None, 0, 0, 0))(
-                    bp_params_used, init_hs_l, _target_obs, _dones,
+                _, q_bp_target = jax.vmap(bp_net.apply, in_axes=(None, 0, 0, 0, 0))(
+                    bp_params_used,
+                    init_hs_l,
+                    _t_priv,
+                    _t_publ,
+                    _dones,
                 )
                 # We use the BP for both target Q lookups; arg-max action under BP.
                 bp_argmax = jnp.argmax(q_bp_target - (1 - _avail) * 1e10, axis=-1)
@@ -393,8 +461,12 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
                 ).squeeze(-1)
 
                 def _loss_fn(params):
-                    _, q_online = jax.vmap(online_net.apply, in_axes=(None, 0, 0, 0))(
-                        params, init_hs_l, _obs, _dones,
+                    _, q_online = jax.vmap(online_net.apply, in_axes=(None, 0, 0, 0, 0))(
+                        params,
+                        init_hs_l,
+                        _priv,
+                        _publ,
+                        _dones,
                     )
                     chosen = jnp.take_along_axis(
                         q_online, _actions[..., None], axis=-1
@@ -419,10 +491,18 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             )
             (train_state, rng), (loss, qvals) = jax.lax.cond(
                 is_learn,
-                lambda ts, r: jax.lax.scan(_learn, (ts, r), None, config.get("NUM_EPOCHS", 1)),
-                lambda ts, r: ((ts, r), (jnp.zeros(config.get("NUM_EPOCHS", 1)),
-                                          jnp.zeros(config.get("NUM_EPOCHS", 1)))),
-                train_state, _rng,
+                lambda ts, r: jax.lax.scan(
+                    _learn, (ts, r), None, config.get("NUM_EPOCHS", 1)
+                ),
+                lambda ts, r: (
+                    (ts, r),
+                    (
+                        jnp.zeros(config.get("NUM_EPOCHS", 1)),
+                        jnp.zeros(config.get("NUM_EPOCHS", 1)),
+                    ),
+                ),
+                train_state,
+                _rng,
             )
 
             train_state = jax.lax.cond(
@@ -437,7 +517,10 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
             )
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
 
-            return (train_state, buffer_state, rng), {"loss": loss.mean(), "qvals": qvals.mean()}
+            return (train_state, buffer_state, rng), {
+                "loss": loss.mean(),
+                "qvals": qvals.mean(),
+            }
 
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, buffer_state, _rng)
@@ -456,13 +539,14 @@ def make_train(config, env, bp_params: Optional[Any], belief_params: Optional[An
 
 def env_from_config(config):
     e = make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    return LogWrapper(e), f"{config['ENV_NAME']}_{config['ENV_KWARGS'].get('num_agents', 2)}p"
+    return LogWrapper(
+        e
+    ), f"{config['ENV_NAME']}_{config['ENV_KWARGS'].get('num_agents', 2)}p"
 
 
 def _maybe_load(path):
     if not path or path == "None" or not os.path.exists(path):
         return None
-    from jaxmarl.wrappers.baselines import load_params
     return load_params(path)
 
 
@@ -473,8 +557,10 @@ def single_run(config):
 
     bp_params = _maybe_load(config.get("BP_CHECKPOINT"))
     belief_params = _maybe_load(config.get("BELIEF_CHECKPOINT"))
-    print(f"[obl] BP loaded: {bp_params is not None}, "
-          f"belief loaded: {belief_params is not None}")
+    print(
+        f"[obl] BP loaded: {bp_params is not None}, "
+        f"belief loaded: {belief_params is not None}"
+    )
     hidden_dim = int(config["HIDDEN_SIZE"])
 
     train_fn = make_train(config, env, bp_params, belief_params, hidden_dim)

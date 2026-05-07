@@ -29,33 +29,11 @@ import flax.linen as nn
 from flax.linen.initializers import constant, orthogonal
 
 
-class ScannedLSTM(nn.Module):
-    """Same shape as the one in r2d2_publ_rnn_hanabi but kept local to avoid
-    a cross-module import cycle when this file is reused inside OBL."""
-
-    @partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0, out_axes=0,
-        split_rngs={"params": False},
-    )
-    @nn.compact
-    def __call__(self, carry, x):
-        ins, resets = x
-        hidden_size = ins.shape[-1]
-        zeros = self.initialize_carry(hidden_size, *ins.shape[:-1])
-        carry = jax.tree.map(
-            lambda c, z: jnp.where(resets[:, np.newaxis], z, c),
-            carry, zeros,
-        )
-        new_carry, y = nn.OptimizedLSTMCell(hidden_size)(carry, ins)
-        return new_carry, y
-
-    @staticmethod
-    def initialize_carry(hidden_size, *batch_size):
-        return nn.OptimizedLSTMCell(hidden_size, parent=None).initialize_carry(
-            jax.random.PRNGKey(0), (*batch_size, hidden_size)
-        )
+# MultiLayerScannedLSTM is the canonical 2-layer LSTM port. Imported from
+# the publ-LSTM module rather than dup'd; there is no import cycle (this
+# file is only consumed by obl_rnn_hanabi.py / obl_train_belief.py which
+# already import r2d2_publ_rnn_hanabi).
+from r2d2_publ_rnn_hanabi import MultiLayerScannedLSTM  # noqa: E402
 
 
 class ARBeliefModel(nn.Module):
@@ -65,12 +43,16 @@ class ARBeliefModel(nn.Module):
     hid_dim: int
     hand_size: int
     out_dim: int = 25  # num_colors * num_ranks for the standard Hanabi config
-    num_lstm_layer: int = 2  # not strictly used since ScannedLSTM is single-layer
+    num_lstm_layer: int = 2  # matches upstream belief_model.py:39
     init_scale: float = 1.0
 
     @nn.compact
     def encode_history(self, priv_s, dones):
-        """Run the per-time-step encoder + LSTM. priv_s: (T, B, in_dim)."""
+        """Run the per-time-step encoder + LSTM. priv_s: (T, B, in_dim).
+
+        Matches upstream `pyhanabi/belief_model.py:41-52`: 2-layer Linear
+        encoder followed by `nn.LSTM(hid_dim, hid_dim, num_layers=2)`.
+        """
         x = nn.Dense(
             self.hid_dim,
             kernel_init=orthogonal(self.init_scale),
@@ -83,9 +65,13 @@ class ARBeliefModel(nn.Module):
             bias_init=constant(0.0),
         )(x)
         x = nn.relu(x)
-        carry = ScannedLSTM.initialize_carry(self.hid_dim, x.shape[1])
+        carry = MultiLayerScannedLSTM.initialize_carry(
+            self.hid_dim, self.num_lstm_layer, x.shape[1]
+        )
         rnn_in = (x, dones)
-        carry, h = ScannedLSTM(name="hist_lstm")(carry, rnn_in)
+        carry, h = MultiLayerScannedLSTM(
+            num_layers=self.num_lstm_layer, name="hist_lstm"
+        )(carry, rnn_in)
         return h  # (T, B, hid_dim)
 
     @nn.compact

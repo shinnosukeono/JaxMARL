@@ -95,23 +95,24 @@ class RandomPolicy:
 class R2D2PublPolicy:
     """Loads R2D2 publ-LSTM params from safetensors and serves them."""
 
-    def __init__(self, params, env, hidden_dim: int):
+    def __init__(self, params, env, hidden_dim: int, num_lstm_layer: int = 2):
         from r2d2_publ_rnn_hanabi import (
-            PublicLSTMQNetwork, ScannedLSTM,
-            hanabi_publ_split, hanabi_feature_widths, reorder_obs_for_split,
+            PublicLSTMQNetwork, MultiLayerScannedLSTM,
+            hanabi_hands_dim, hanabi_feature_widths, split_obs_publ_priv,
         )
         wrapped_action_dim = self._max_action_space(env)
-        priv_dim, _ = hanabi_publ_split(env)
         self._network = PublicLSTMQNetwork(
             action_dim=wrapped_action_dim,
             hidden_dim=hidden_dim,
-            publ_split=priv_dim,
+            num_lstm_layer=num_lstm_layer,
         )
         self._params = params
         self._hidden_dim = hidden_dim
+        self._num_lstm_layer = num_lstm_layer
         self._widths = hanabi_feature_widths(env)
-        self._reorder = reorder_obs_for_split
-        self._init_carry_fn = ScannedLSTM.initialize_carry
+        self._hands_dim = hanabi_hands_dim(env)
+        self._split = split_obs_publ_priv
+        self._init_carry_fn = MultiLayerScannedLSTM.initialize_carry
 
     @staticmethod
     def _max_action_space(env):
@@ -126,15 +127,16 @@ class R2D2PublPolicy:
 
     def to_policy(self) -> Policy:
         def init_carry(batch):
-            return self._init_carry_fn(self._hidden_dim, batch)
+            return self._init_carry_fn(self._hidden_dim, self._num_lstm_layer, batch)
 
         def act(carry, packet):
-            obs = packet["obs_reordered"]   # (batch, obs_dim)
+            obs = packet["obs"]             # (batch, obs_dim)
             done = packet["done"]           # (batch,)
             obs_t = obs[None, :]            # add time dim
             done_t = done[None, :].astype(jnp.float32)
+            priv_t, publ_t = self._split(obs_t, self._hands_dim)
             new_carry, q_vals = self._network.apply(
-                self._params, carry, obs_t, done_t
+                self._params, carry, priv_t, publ_t, done_t
             )
             q_vals = q_vals.squeeze(axis=0)
             avail = packet["avail"]
@@ -310,18 +312,13 @@ def cross_play(policies: List, env, num_games: int = 1000, seed: int = 0,
 
     carries = [p.init_carry(num_games) for p in pol_objs]
 
-    # We'll need numerical-reordered obs for R2D2-publ.
-    from r2d2_publ_rnn_hanabi import (
-        hanabi_feature_widths, reorder_obs_for_split,
-    )
-    widths = hanabi_feature_widths(env)
-
+    # JaxMARL Hanabi obs is already in canonical order for the priv/publ
+    # slice; no reordering is needed for R2D2-publ.
     def per_agent_packet(i, env_state, prev_state, last_actions, obs_dict, dones, rng_):
         avail = wrapped.get_valid_actions(env_state.env_state)[env.agents[i]]
         packet = {"avail": avail, "done": dones[env.agents[i]]}
         if pol_objs[i].obs_kind == "numerical":
-            o = reorder_obs_for_split(obs_dict[env.agents[i]], widths)
-            packet["obs_reordered"] = o
+            packet["obs"] = obs_dict[env.agents[i]]
             packet["rng"] = rng_
         elif pol_objs[i].obs_kind == "text":
             tp = text_policies[i]
